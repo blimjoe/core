@@ -252,7 +252,7 @@ class Ytmusic {
                 cookie?.let { cookie ->
                     append("Cookie", cookie)
                     if ("SAPISID" !in cookieMap || "__Secure-3PAPISID" !in cookieMap) return@let
-                    val currentTime = now().toInstant(TimeZone.currentSystemDefault()).epochSeconds / 1000
+                    val currentTime = now().toInstant(TimeZone.currentSystemDefault()).epochSeconds
                     val sapisidCookie = cookieMap["SAPISID"] ?: cookieMap["__Secure-3PAPISID"]
                     val sapisidHash = sha1("$currentTime $sapisidCookie https://music.youtube.com")
                     Logger.d(TAG, "SAPI SID Hash: SAPISIDHASH ${currentTime}_$sapisidHash")
@@ -268,7 +268,7 @@ class Ytmusic {
     internal fun getAuthorizationHeader(): String? =
         cookie?.let { cookie ->
             if ("SAPISID" !in cookieMap || "__Secure-3PAPISID" !in cookieMap) null
-            val currentTime = now().toInstant(TimeZone.currentSystemDefault()).epochSeconds / 1000
+            val currentTime = now().toInstant(TimeZone.currentSystemDefault()).epochSeconds
             val sapisidCookie = cookieMap["SAPISID"] ?: cookieMap["__Secure-3PAPISID"]
             val sapisidHash = sha1("$currentTime $sapisidCookie https://music.youtube.com")
             Logger.d(TAG, "SAPI SID Hash: SAPISIDHASH ${currentTime}_$sapisidHash")
@@ -420,6 +420,17 @@ class Ytmusic {
                     cpn = null,
                 ),
             )
+            parameter("prettyPrint", false)
+        }
+
+    internal suspend fun nativePlayer(client: YouTubeClient, videoId: String, visitor: String?, cpn: String) =
+        httpClient.post("https://www.youtube.com/youtubei/v1/player") {
+            contentType(ContentType.Application.Json)
+            header(HttpHeaders.UserAgent, client.userAgent)
+            header("X-YouTube-Client-Name", client.xClientName.toString())
+            header("X-YouTube-Client-Version", client.clientVersion)
+            setBody(PlayerBody(context = client.toContext(locale, visitor), videoId = videoId,
+                playlistId = null, cpn = cpn, playbackContext = PlayerBody.PlaybackContext()))
             parameter("prettyPrint", false)
         }
 

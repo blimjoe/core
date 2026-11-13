@@ -1558,6 +1558,20 @@ class YouTube {
                         ]
                     }.joinToString("")
 
+            nativePlaybackClient()?.let { client ->
+                val native = ytMusic.nativePlayer(client, videoId, visitorData(), cpn).body<PlayerResponse>()
+                check(native.playabilityStatus.status == "OK") {
+                    native.playabilityStatus.reason ?: "This track is unavailable to the iOS playback client"
+                }
+                val stream = native.streamingData
+                check(stream?.hlsManifestUrl != null || stream?.adaptiveFormats?.any { !it.url.isNullOrEmpty() } == true) {
+                    "No AAC or HLS stream is available for this track"
+                }
+                val thumb = native.videoDetails?.thumbnail?.thumbnails?.firstOrNull()
+                val type = if (thumb != null && thumb.width == thumb.height) MediaType.Song else MediaType.Video
+                return@runCatching Triple(cpn, native, type)
+            }
+
             var decodedSigResponse: PlayerResponse? = null
             val tempRes =
                 ytMusic
