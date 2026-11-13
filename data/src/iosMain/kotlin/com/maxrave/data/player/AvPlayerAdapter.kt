@@ -3,12 +3,14 @@
 package com.maxrave.data.player
 
 import com.maxrave.domain.data.player.*
+import com.maxrave.domain.extension.isVideo
 import com.maxrave.data.io.fileSystem
 import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.domain.repository.StreamRepository
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.firstOrNull
 import platform.AVFoundation.*
@@ -31,6 +33,7 @@ class AvPlayerAdapter(
     private var loadJob: Job? = null
     private var generation = 0L
     private var pendingSeekPosition = 0L
+    private var watchVideoEnabled = false
     private var released = false
     private var lastPlaying = false
     private var interrupted = false
@@ -39,6 +42,14 @@ class AvPlayerAdapter(
     private val observers = mutableListOf<NSObjectProtocol>()
 
     init {
+        scope.launch {
+            dataStore.watchVideoInsteadOfPlayingAudio.collect { preference ->
+                val enabled = preference == DataStoreManager.TRUE
+                val changed = enabled != watchVideoEnabled
+                watchVideoEnabled = enabled
+                if (changed && currentMediaItem?.isVideo() == true) load(currentPosition)
+            }
+        }
         observers += notifications.addObserverForName(AVPlayerItemDidPlayToEndTimeNotification, null,
             NSOperationQueue.mainQueue) { notification ->
             if (notification?.`object` == nativePlayer.currentItem) {
@@ -121,6 +132,7 @@ class AvPlayerAdapter(
         val request = ++generation
         pendingSeekPosition = position.coerceAtLeast(0)
         val media = currentMediaItem ?: return
+        val wantsVideo = watchVideoEnabled && media.isVideo()
         nativePlayer.pause()
         nativePlayer.replaceCurrentItemWithPlayerItem(null)
         setState(PlayerConstants.STATE_BUFFERING)
@@ -133,8 +145,12 @@ class AvPlayerAdapter(
                 else withContext(Dispatchers.IO) {
                     // HLS combines audio/video in a format AVFoundation can decode without
                     // the separate WebM/Opus demuxing used by the Android and desktop engines.
-                    streams.getStream(dataStore, media.mediaId, false, false, audioMimeType = "audio/mp4").filterNotNull().firstOrNull()
-                        ?: streams.getStream(dataStore, media.mediaId, false, false, muxed = true).filterNotNull().firstOrNull()
+                    if (wantsVideo) {
+                        streams.getStream(dataStore, media.mediaId, false, true, muxed = true).filterNotNull().firstOrNull()
+                    } else {
+                        streams.getStream(dataStore, media.mediaId, false, false, audioMimeType = "audio/mp4").filterNotNull().firstOrNull()
+                            ?: streams.getStream(dataStore, media.mediaId, false, false, muxed = true).filterNotNull().firstOrNull()
+                    }
                 }
                 ensureActive()
                 if (request != generation) return@launch
