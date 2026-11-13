@@ -90,6 +90,7 @@ kotlin {
                 }
 
                 implementation(libs.kotlin.stdlib)
+                implementation(libs.atomicfu)
                 // Add KMP dependencies here
                 // Kotlinx serialization
                 implementation(libs.kotlinx.serialization.json)

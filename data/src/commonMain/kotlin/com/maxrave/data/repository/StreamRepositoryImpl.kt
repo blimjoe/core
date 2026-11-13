@@ -89,6 +89,7 @@ internal class StreamRepositoryImpl(
         isDownloading: Boolean,
         isVideo: Boolean,
         muxed: Boolean,
+        audioMimeType: String?,
     ): Flow<String?> =
         flow {
             val itag =
@@ -168,11 +169,13 @@ internal class StreamRepositoryImpl(
                             ?: formatList.find { it.itag == ITAG.VIDEO_360P }
                             ?: formatList.find { !it.isAudio && it.url.isNullOrEmpty().not() }
                     val audioTwinItag = ITAG.highQualityTwinOf(itag)
+                    val compatibleAudio = if (audioMimeType == null) formatList else
+                        formatList.filter { it.isAudio && it.mimeType?.startsWith(audioMimeType) == true }
                     val audioFormat =
-                        formatList.find { it.itag == itag } ?: if (audioTwinItag != null) {
-                            formatList.find { it.itag == audioTwinItag }
+                        compatibleAudio.find { it.itag == itag } ?: if (audioTwinItag != null) {
+                            compatibleAudio.find { it.itag == audioTwinItag }
                         } else {
-                            formatList.find { it.isAudio && it.url.isNullOrEmpty().not() }
+                            compatibleAudio.find { it.isAudio && it.url.isNullOrEmpty().not() }
                         }
                     var format =
                         if (isVideo) {
@@ -180,6 +183,10 @@ internal class StreamRepositoryImpl(
                         } else {
                             audioFormat
                         }
+                    if (format == null && audioMimeType != null && !isVideo && !muxed) {
+                        format = compatibleAudio.maxByOrNull { it.bitrate ?: 0 }
+                        if (format == null) { emit(null); return@onSuccess }
+                    }
                     if (format == null) {
                         format = formatList.lastOrNull { it.url.isNullOrEmpty().not() }
                     }

@@ -22,6 +22,7 @@ interface StreamRepository {
         isDownloading: Boolean,
         isVideo: Boolean,
         muxed: Boolean = false, // m3u8 or mp4 (both contain audio and video)
+        audioMimeType: String? = null, // Optional decoder capability, e.g. audio/mp4 on AVFoundation
     ): Flow<String?>
 
     fun initPlayback(

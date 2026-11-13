@@ -12,7 +12,7 @@ actual fun createMediaServiceHandler(
     discordRepository: DiscordRepository,
     coroutineScope: kotlinx.coroutines.CoroutineScope,
 ): com.maxrave.domain.mediaservice.handler.MediaPlayerHandler =
-    JvmMediaPlayerHandlerImpl(
+    SharedMediaPlayerHandler(
         dataStoreManager = dataStoreManager,
         songRepository = songRepository,
         streamRepository = streamRepository,

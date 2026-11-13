@@ -19,9 +19,6 @@ import com.maxrave.common.SponsorBlockType
 import com.maxrave.common.TITLE
 import com.maxrave.data.db.Converters
 import com.maxrave.data.lastfm.LastfmScrobbler
-import com.maxrave.data.mediaservice.mac.MacOSMediaIntegration
-import com.maxrave.data.mediaservice.mac.MacOSRemoteCommandListener
-import com.maxrave.data.mediaservice.mac.NowPlayingInfo
 import com.maxrave.domain.data.entities.NewFormatEntity
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
@@ -81,6 +78,10 @@ import com.maxrave.logger.Logger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
+import kotlinx.atomicfu.atomic
+import kotlin.concurrent.Volatile
+import kotlin.time.TimeSource
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -109,17 +110,12 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import org.koin.mp.KoinPlatform.getKoin
-import org.simpmusic.nowplayingcenter.NPYC
-import org.simpmusic.nowplayingcenter.domain.NowPlayingListener
-import org.simpmusic.nowplayingcenter.domain.Platform
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.pow
 import kotlin.time.Duration.Companion.milliseconds
 
-private val TAG = "JvmMediaPlayerHandler"
+private val TAG = "MediaPlayerHandler"
 
 // Ceiling on how far the published position may run ahead of the last real reading from mpv.
 // Sized just above the largest staircase step measured on this machine (~520 ms), so an ordinary
@@ -136,7 +132,7 @@ private const val SMOOTH_SNAP_MS = 1_000L
 // a second late), the watch-time pings, the 5 s position save and the scrobbler.
 private const val OFF_SCREEN_TICK_MS = 1_000L
 
-class JvmMediaPlayerHandlerImpl(
+class SharedMediaPlayerHandler(
     private val dataStoreManager: DataStoreManager,
     private val songRepository: SongRepository,
     private val streamRepository: StreamRepository,
@@ -158,6 +154,7 @@ class JvmMediaPlayerHandlerImpl(
     // Only what is PUBLISHED is smoothed. Everything that reads the player to decide something —
     // the crossfade trigger, the sleep timer, the position persist, the scrobbler — still sees
     // mpv's own number.
+    private val monotonicOrigin = TimeSource.Monotonic.markNow()
     private var smoothAnchorMs = -1L
     private var smoothAnchorAtNanos = 0L
     private var smoothLastPublishedMs = -1L
@@ -178,7 +175,7 @@ class JvmMediaPlayerHandlerImpl(
 
     private fun smoothedPosition(rawMs: Long): Long {
         val playing = _controlState.value.isPlaying
-        val nowNanos = System.nanoTime()
+        val nowNanos = monotonicOrigin.elapsedNow().inWholeNanoseconds
         val resync =
             !playing ||
                 smoothAnchorMs < 0L ||
@@ -202,41 +199,7 @@ class JvmMediaPlayerHandlerImpl(
         return publishedMs
     }
 
-    // Linux (MPRIS) and Windows (SMTC) both go through NPYC/JMTC; macOS uses the
-    // dedicated MacOSMediaIntegration below. runCatching keeps a failed native
-    // init from taking down the whole handler — every nypc call site is already
-    // null-safe, so a null here simply disables system media controls.
-    private val nypc =
-        if (getPlatform() is Platform.Linux || getPlatform() is Platform.Windows) {
-            runCatching { NPYC(getPlatform()) }.getOrNull()
-        } else {
-            null
-        }
-
-    // macOS Media Integration (Now Playing Center + Remote Command Center)
-    private val macOSMediaIntegration: MacOSMediaIntegration? by lazy {
-        if (MacOSMediaIntegration.isSupported()) {
-            MacOSMediaIntegration.getInstance()
-        } else {
-            null
-        }
-    }
-
-    private fun getPlatform(): Platform {
-        val os = System.getProperty("os.name").lowercase()
-        return if (os.contains("win")) {
-            Platform.Windows
-        } else if (os.contains("mac")) {
-            Platform.MacOs
-        } else {
-            Platform.Linux(
-                "SimpMusic",
-                // MPRIS DesktopEntry: GNOME takes the media widget's icon from "<this>.desktop",
-                // so it must name the file the AppImage's AppRun installs (desktopApp/build.gradle.kts).
-                "com-maxrave-simpmusic-MainKt",
-            )
-        }
-    }
+    private val systemMedia = createSystemMediaBridge()
 
     override val player: MediaPlayerInterface = getKoin().get()
 
@@ -383,7 +346,7 @@ class JvmMediaPlayerHandlerImpl(
     // suspend-resume interleaving) and conflated through a single sender (rpcSenderJob), which drops
     // any snapshot older than the last one it handled and drops snapshots while playback isn't active
     // (per controlState.isPlaying) so a stale in-flight send can't resurrect presence after pause/close.
-    private val rpcEventSeq = AtomicLong(0L)
+    private val rpcEventSeq = atomic(0L)
 
     private data class RpcSnapshot(
         val song: SongEntity,
@@ -532,33 +495,7 @@ class JvmMediaPlayerHandlerImpl(
         }
         player.volume = runBlocking { dataStoreManager.playerVolume.first() }
         mayBeRestoreQueue()
-        nypc?.setListener(
-            object : NowPlayingListener {
-                override fun onPlayPause() {
-                    coroutineScope.launch {
-                        onPlayerEvent(PlayerEvent.PlayPause)
-                    }
-                }
 
-                override fun onNext() {
-                    coroutineScope.launch {
-                        onPlayerEvent(PlayerEvent.Next)
-                    }
-                }
-
-                override fun onPrevious() {
-                    coroutineScope.launch {
-                        onPlayerEvent(PlayerEvent.Previous)
-                    }
-                }
-
-                override fun onStop() {
-                    coroutineScope.launch {
-                        onPlayerEvent(PlayerEvent.Stop)
-                    }
-                }
-            },
-        )
         // Initialize macOS media integration
         initializeMacOSMediaIntegration()
         coroutineScope.launch {
@@ -825,13 +762,8 @@ class JvmMediaPlayerHandlerImpl(
                     // Launched separately: "now playing" is a network round trip, and this job
                     // still has the rest of the track state to publish.
                     coroutineScope.launch { lastfmScrobbler.onTrackStarted(song) }
-                    nypc?.setNowPlaying(
-                        song.title,
-                        song.artistName?.joinToString(", ") ?: "",
-                        song.albumName ?: "",
-                        song.thumbnails,
-                    )
-                    updateMacOSNowPlayingInfo(song)
+
+                    updateMacOSSystemNowPlayingInfo(song)
                 }
                 songEntityJob?.cancel()
                 songEntityJob =
@@ -998,11 +930,7 @@ class JvmMediaPlayerHandlerImpl(
                         ),
             )
         coroutineScope.launch {
-            nypc?.setButtonEnabled(
-                isPlaying = controlState.value.isPlaying,
-                canGoNext = controlState.value.isNextAvailable,
-                canGoPrevious = controlState.value.isPreviousAvailable,
-            )
+
         }
         updateMacOSCommandsEnabled()
     }
@@ -2701,10 +2629,9 @@ class JvmMediaPlayerHandlerImpl(
 
     override fun release() {
         Logger.w("ServiceHandler", "Starting release process")
-        nypc?.removeListener()
         // Release macOS media integration
-        clearMacOSNowPlayingInfo()
-        macOSMediaIntegration?.release()
+        clearMacOSSystemNowPlayingInfo()
+        systemMedia?.release()
         try {
             if (discordRPC?.isRpcRunning() == true) {
                 discordRPC?.closeRPC()
@@ -3117,7 +3044,7 @@ class JvmMediaPlayerHandlerImpl(
      * [trimRadioHistoryIfNeeded] from a view model on the UI thread while the player thread reaches
      * it too.
      */
-    private val radioTrimInFlight = AtomicBoolean(false)
+    private val radioTrimInFlight = atomic(false)
 
     /**
      * Asks the player to drop the oldest played tracks of a radio queue.
@@ -3135,7 +3062,7 @@ class JvmMediaPlayerHandlerImpl(
      * snapshots from before the cut, arrive first.
      */
     private fun trimRadioHistoryIfNeeded() {
-        if (radioTrimInFlight.get()) return
+        if (radioTrimInFlight.value) return
         val data = queueData.value.data
         if (!RadioQueueTrim.appliesTo(data.playlistType, data.playlistId)) return
         // Shuffle splits the two index spaces: `currentMediaItemIndex` and the indices
@@ -3161,7 +3088,7 @@ class JvmMediaPlayerHandlerImpl(
      * guess made from a later timeline event.
      */
     private fun onRadioHistoryRemoved(removedIds: List<String>) {
-        radioTrimInFlight.set(false)
+        radioTrimInFlight.value = false
         if (removedIds.isEmpty()) return
         var cut = false
         _queueData.update { state ->
@@ -3183,21 +3110,21 @@ class JvmMediaPlayerHandlerImpl(
      * Initialize macOS Now Playing Center and Remote Command Center
      */
     private fun initializeMacOSMediaIntegration() {
-        macOSMediaIntegration?.let { integration ->
+        systemMedia?.let { integration ->
             if (integration.initialize()) {
                 integration.setRemoteCommandListener(
-                    object : MacOSRemoteCommandListener {
+                    object : SystemRemoteCommandListener {
                         override fun onPlay() {
-                            Logger.d(TAG, "macOS Remote: Play")
+                            Logger.d(TAG, "Remote: Play")
                             coroutineScope.launch {
-                                onPlayerEvent(PlayerEvent.PlayPause)
+                                player.play()
                             }
                         }
 
                         override fun onPause() {
-                            Logger.d(TAG, "macOS Remote: Pause")
+                            Logger.d(TAG, "Remote: Pause")
                             coroutineScope.launch {
-                                onPlayerEvent(PlayerEvent.PlayPause)
+                                player.pause()
                             }
                         }
 
@@ -3265,9 +3192,9 @@ class JvmMediaPlayerHandlerImpl(
     /**
      * Update macOS Now Playing info with current media item
      */
-    private fun updateMacOSNowPlayingInfo(songEntity: SongEntity) {
-        macOSMediaIntegration?.updateNowPlayingInfo(
-            NowPlayingInfo(
+    private fun updateMacOSSystemNowPlayingInfo(songEntity: SongEntity) {
+        systemMedia?.updateNowPlayingInfo(
+            SystemNowPlayingInfo(
                 title = songEntity.title,
                 artist = songEntity.artistName?.connectArtists() ?: "Unknown Artist",
                 album = songEntity.albumName ?: "",
@@ -3287,7 +3214,7 @@ class JvmMediaPlayerHandlerImpl(
         val artworkUrl = songEntity.thumbnails
         if (!artworkUrl.isNullOrEmpty()) {
             coroutineScope.launch {
-                macOSMediaIntegration?.loadAndSetArtwork(artworkUrl)
+                systemMedia?.loadAndSetArtwork(artworkUrl)
             }
         }
     }
@@ -3296,7 +3223,7 @@ class JvmMediaPlayerHandlerImpl(
      * Update macOS Now Playing playback state
      */
     private fun updateMacOSPlaybackState(isPlaying: Boolean) {
-        macOSMediaIntegration?.updatePlaybackState(isPlaying)
+        systemMedia?.updatePlaybackState(isPlaying)
     }
 
     /**
@@ -3306,7 +3233,7 @@ class JvmMediaPlayerHandlerImpl(
         val hasNext = _controlState.value.isNextAvailable
         val hasPrevious = _controlState.value.isPreviousAvailable
         val canSeek = getPlayerDuration() > 0
-        macOSMediaIntegration?.updateCommandsEnabled(
+        systemMedia?.updateCommandsEnabled(
             hasNext = hasNext,
             hasPrevious = hasPrevious,
             canSeek = canSeek,
@@ -3317,13 +3244,13 @@ class JvmMediaPlayerHandlerImpl(
      * Update macOS Now Playing elapsed time (called periodically)
      */
     private fun updateMacOSElapsedTime() {
-        macOSMediaIntegration?.updateElapsedTime(player.currentPosition / 1000.0, 1.0)
+        systemMedia?.updateElapsedTime(player.currentPosition / 1000.0, 1.0)
     }
 
     /**
      * Clear macOS Now Playing info
      */
-    private fun clearMacOSNowPlayingInfo() {
-        macOSMediaIntegration?.clearNowPlayingInfo()
+    private fun clearMacOSSystemNowPlayingInfo() {
+        systemMedia?.clearNowPlayingInfo()
     }
 }

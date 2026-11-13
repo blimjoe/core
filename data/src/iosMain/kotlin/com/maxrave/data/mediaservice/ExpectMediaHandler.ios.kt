@@ -1,5 +1,6 @@
 package com.maxrave.data.mediaservice
 
+import com.maxrave.domain.repository.AnalyticsRepository
 import com.maxrave.domain.repository.DiscordRepository
 
 actual fun createMediaServiceHandler(
@@ -7,9 +8,16 @@ actual fun createMediaServiceHandler(
     songRepository: com.maxrave.domain.repository.SongRepository,
     streamRepository: com.maxrave.domain.repository.StreamRepository,
     localPlaylistRepository: com.maxrave.domain.repository.LocalPlaylistRepository,
-    analyticsRepository: com.maxrave.domain.repository.AnalyticsRepository,
+    analyticsRepository: AnalyticsRepository,
     discordRepository: DiscordRepository,
     coroutineScope: kotlinx.coroutines.CoroutineScope,
-): com.maxrave.domain.mediaservice.handler.MediaPlayerHandler {
-    TODO("Not yet implemented")
-}
+): com.maxrave.domain.mediaservice.handler.MediaPlayerHandler =
+    SharedMediaPlayerHandler(
+        dataStoreManager = dataStoreManager,
+        songRepository = songRepository,
+        streamRepository = streamRepository,
+        localPlaylistRepository = localPlaylistRepository,
+        analyticsRepository = analyticsRepository,
+        discordRepository = discordRepository,
+        coroutineScope = coroutineScope,
+    )

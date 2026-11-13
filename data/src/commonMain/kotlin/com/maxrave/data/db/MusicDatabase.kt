@@ -2,6 +2,8 @@ package com.maxrave.data.db
 
 import DatabaseDao
 import androidx.room.AutoMigration
+import androidx.room.ConstructedBy
+import androidx.room.RoomDatabaseConstructor
 import androidx.room.Database
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
@@ -107,6 +109,7 @@ import com.maxrave.domain.data.entities.sync.SyncChangeEntity
         AutoMigration(25, 28),
     ],
 )
+@ConstructedBy(MusicDatabaseConstructor::class)
 @TypeConverters(Converters::class)
 abstract class MusicDatabase : RoomDatabase() {
     abstract fun getDatabaseDao(): DatabaseDao
@@ -146,3 +149,7 @@ abstract class MusicDatabase : RoomDatabase() {
 expect fun getDatabaseBuilder(converters: Converters): RoomDatabase.Builder<MusicDatabase>
 
 expect fun getDatabasePath(): String
+@Suppress("KotlinNoActualForExpect")
+expect object MusicDatabaseConstructor : RoomDatabaseConstructor<MusicDatabase> {
+    override fun initialize(): MusicDatabase
+}
