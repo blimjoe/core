@@ -197,11 +197,15 @@ class AvPlayerAdapter(
     override fun setMediaItem(mediaItem: GenericMediaItem) = mutate { clearMediaItems(); addMediaItem(mediaItem) }
     override fun addMediaItem(mediaItem: GenericMediaItem) = mutate { addMediaItem(items.size, mediaItem) }
     override fun addMediaItem(index: Int, mediaItem: GenericMediaItem) = mutate {
+        val wasEmpty = items.isEmpty()
         val at = index.coerceIn(0, items.size)
         items.add(at, mediaItem)
         if (this.index >= at) this.index++
         if (this.index < 0) this.index = 0
         rebuildOrder(); timeline()
+        if (wasEmpty) listeners.toList().forEach {
+            it.onMediaItemTransition(currentMediaItem, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED)
+        }
     }
     override fun removeMediaItem(index: Int) = removeMediaItems(index, index + 1) {}
     override fun removeMediaItems(fromIndex: Int, toIndex: Int, onRemoved: (List<String>) -> Unit) = mutate {
@@ -217,7 +221,10 @@ class AvPlayerAdapter(
             else -> oldIndex
         }
         rebuildOrder(); onRemoved(removed); timeline()
-        if (removedCurrent) { if (items.isEmpty()) stop() else select(index, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) }
+        if (removedCurrent) { if (items.isEmpty()) {
+            stop()
+            listeners.toList().forEach { it.onMediaItemTransition(null, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) }
+        } else select(index, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) }
     }
     override fun moveMediaItem(fromIndex: Int, toIndex: Int) = mutate {
         if (fromIndex !in items.indices || toIndex !in items.indices) return@mutate
@@ -234,7 +241,10 @@ class AvPlayerAdapter(
         if (!shuffleModeEnabled || fromShuffledIndex !in order.indices || toShuffledIndex !in order.indices) return@mutate
         order.add(toShuffledIndex, order.removeAt(fromShuffledIndex)); timeline()
     }
-    override fun clearMediaItems() = mutate { stop(); items.clear(); order.clear(); index = -1; timeline() }
+    override fun clearMediaItems() = mutate {
+        stop(); items.clear(); order.clear(); index = -1; timeline()
+        listeners.toList().forEach { it.onMediaItemTransition(null, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) }
+    }
     override fun replaceMediaItem(index: Int, mediaItem: GenericMediaItem) = mutate {
         if (index in items.indices) { items[index] = mediaItem; timeline() }
     }
