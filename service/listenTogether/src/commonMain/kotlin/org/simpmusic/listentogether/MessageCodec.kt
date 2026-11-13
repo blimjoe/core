@@ -4,6 +4,7 @@
  */
 package org.simpmusic.listentogether
 
+import okio.use
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.protobuf.ProtoBuf
 import okio.Buffer
