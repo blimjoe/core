@@ -143,6 +143,9 @@ class SharedMediaPlayerHandler(
 ) : MediaPlayerHandler,
     MediaPlayerListener {
     private val backgroundScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val startupJob: Job
+
+    suspend fun awaitStartup() = startupJob.join()
 
     // Smoothing state for the position this handler PUBLISHES. Measured on 2026-09-12: mpv moves
     // `time-pos` only three to four times a second, in steps of 250-500 ms, so the raw number is a
@@ -392,7 +395,7 @@ class SharedMediaPlayerHandler(
         getSkipSegmentsJob = Job()
         getFormatJob = Job()
         jobWatchtime = Job()
-        skipSilent = runBlocking { dataStoreManager.skipSilent.first() == TRUE }
+        coroutineScope.launch { skipSilent = dataStoreManager.skipSilent.first() == TRUE }
         // Collected rather than read once like the settings around it: the equalizer is adjusted
         // while music is playing, and a curve that only takes effect after a restart is useless
         // for judging what you just changed.
@@ -463,38 +466,40 @@ class SharedMediaPlayerHandler(
                 }
             }.distinctUntilChanged().collect { player.setEightD(it) }
         }
-        normalizeVolume =
-            runBlocking { dataStoreManager.normalizeVolume.first() == TRUE }
-        _nowPlaying.value = player.currentMediaItem
-        if (runBlocking { dataStoreManager.saveStateOfPlayback.first() } == TRUE) {
-            Logger.d(TAG, "SaveStateOfPlayback TRUE")
-            val shuffleKey = runBlocking { dataStoreManager.shuffleKey.first() }
-            val repeatKey = runBlocking { dataStoreManager.repeatKey.first() }
-            Logger.d(TAG, "Shuffle: $shuffleKey")
-            Logger.d(TAG, "Repeat: $repeatKey")
-            val restoredShuffle = shuffleKey == TRUE
-            val restoredRepeatMode =
-                when (repeatKey) {
-                    DataStoreManager.REPEAT_ONE -> PlayerConstants.REPEAT_MODE_ONE
-                    DataStoreManager.REPEAT_ALL -> PlayerConstants.REPEAT_MODE_ALL
-                    else -> PlayerConstants.REPEAT_MODE_OFF
-                }
-            player.shuffleModeEnabled = restoredShuffle
-            player.repeatMode = restoredRepeatMode
-            // Ensure controlState is in sync after restore, regardless of listener callbacks
-            _controlState.value =
-                _controlState.value.copy(
-                    isShuffle = restoredShuffle,
-                    repeatState =
-                        when (restoredRepeatMode) {
-                            PlayerConstants.REPEAT_MODE_ONE -> RepeatState.One
-                            PlayerConstants.REPEAT_MODE_ALL -> RepeatState.All
-                            else -> RepeatState.None
-                        },
-                )
+        startupJob = coroutineScope.launch {
+            normalizeVolume =
+                dataStoreManager.normalizeVolume.first() == TRUE
+            _nowPlaying.value = player.currentMediaItem
+            if (dataStoreManager.saveStateOfPlayback.first() == TRUE) {
+                Logger.d(TAG, "SaveStateOfPlayback TRUE")
+                val shuffleKey = dataStoreManager.shuffleKey.first()
+                val repeatKey = dataStoreManager.repeatKey.first()
+                Logger.d(TAG, "Shuffle: $shuffleKey")
+                Logger.d(TAG, "Repeat: $repeatKey")
+                val restoredShuffle = shuffleKey == TRUE
+                val restoredRepeatMode =
+                    when (repeatKey) {
+                        DataStoreManager.REPEAT_ONE -> PlayerConstants.REPEAT_MODE_ONE
+                        DataStoreManager.REPEAT_ALL -> PlayerConstants.REPEAT_MODE_ALL
+                        else -> PlayerConstants.REPEAT_MODE_OFF
+                    }
+                player.shuffleModeEnabled = restoredShuffle
+                player.repeatMode = restoredRepeatMode
+                // Ensure controlState is in sync after restore, regardless of listener callbacks
+                _controlState.value =
+                    _controlState.value.copy(
+                        isShuffle = restoredShuffle,
+                        repeatState =
+                            when (restoredRepeatMode) {
+                                PlayerConstants.REPEAT_MODE_ONE -> RepeatState.One
+                                PlayerConstants.REPEAT_MODE_ALL -> RepeatState.All
+                                else -> RepeatState.None
+                            },
+                    )
+            }
+            player.volume = dataStoreManager.playerVolume.first()
+            mayBeRestoreQueue()
         }
-        player.volume = runBlocking { dataStoreManager.playerVolume.first() }
-        mayBeRestoreQueue()
 
         // Initialize macOS media integration
         initializeMacOSMediaIntegration()
@@ -2536,13 +2541,15 @@ class SharedMediaPlayerHandler(
     }
 
     override fun mayBeSavePlaybackState() {
-        if (runBlocking { dataStoreManager.saveStateOfPlayback.first() } == TRUE) {
-            runBlocking {
-                dataStoreManager.recoverShuffleAndRepeatKey(
-                    player.shuffleModeEnabled,
-                    player.repeatMode,
-                )
-            }
+        val shuffle = player.shuffleModeEnabled
+        val repeat = player.repeatMode
+        // This finite write must finish even when release cancels the player's service scope.
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching {
+                if (dataStoreManager.saveStateOfPlayback.first() == TRUE) {
+                    dataStoreManager.recoverShuffleAndRepeatKey(shuffle, repeat)
+                }
+            }.onFailure { Logger.e(TAG, "Unable to save playback settings", it) }
         }
     }
 
@@ -2583,6 +2590,11 @@ class SharedMediaPlayerHandler(
                     ?.firstOrNull()
                     ?.listTrack
                     .orEmpty()
+            // The user may have selected a track while the database snapshot was loading.
+            if (player.mediaItemCount > 0) {
+                if (playWhenReady) player.play()
+                return@withLock true
+            }
             // The saved queue may not contain the saved track (e.g. persisted while the
             // queue was being rebuilt). Put the track at the front then: updateCatalog
             // skips listTracks[index] as "already in the player", so index must point at

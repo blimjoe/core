@@ -30,6 +30,7 @@ class AvPlayerAdapter(
     private var index = -1
     private var loadJob: Job? = null
     private var generation = 0L
+    private var pendingSeekPosition = 0L
     private var released = false
     private var lastPlaying = false
     private var interrupted = false
@@ -70,7 +71,10 @@ class AvPlayerAdapter(
             while (isActive) {
                 val item = nativePlayer.currentItem
                 when (item?.status) {
-                    AVPlayerItemStatusReadyToPlay -> if (state == PlayerConstants.STATE_BUFFERING) setState(PlayerConstants.STATE_READY)
+                    AVPlayerItemStatusReadyToPlay -> if (state == PlayerConstants.STATE_BUFFERING) {
+                        setState(PlayerConstants.STATE_READY)
+                        applyPlayback()
+                    }
                     AVPlayerItemStatusFailed -> if (state != PlayerConstants.STATE_IDLE) {
                         fail(item.error?.localizedDescription ?: "Unable to play this stream")
                     }
@@ -85,7 +89,13 @@ class AvPlayerAdapter(
         }
     }
 
-    private fun mutate(block: () -> Unit) { if (!released) scope.launch { block() } }
+    private fun mutate(block: () -> Unit) {
+        if (released) return
+        // Nested coroutine launches can defer even on Main.immediate. Execute directly on
+        // the main thread so clear/add/seek/play and their backing fields keep call order.
+        if (NSThread.isMainThread) block()
+        else scope.launch { if (!released) block() }
+    }
     private fun setState(value: Int) {
         if (state == value) return
         state = value
@@ -109,6 +119,7 @@ class AvPlayerAdapter(
     private fun load(position: Long = 0) {
         loadJob?.cancel()
         val request = ++generation
+        pendingSeekPosition = position.coerceAtLeast(0)
         val media = currentMediaItem ?: return
         nativePlayer.pause()
         nativePlayer.replaceCurrentItemWithPlayerItem(null)
@@ -129,7 +140,7 @@ class AvPlayerAdapter(
                 if (request != generation) return@launch
                 val url = resolved?.let { NSURL.URLWithString(it) } ?: error("No playable stream was returned")
                 nativePlayer.replaceCurrentItemWithPlayerItem(AVPlayerItem(uRL = url))
-                if (position > 0) nativePlayer.seekToTime(CMTimeMakeWithSeconds(position / 1000.0, 1000))
+                if (pendingSeekPosition > 0) nativePlayer.seekToTime(CMTimeMakeWithSeconds(pendingSeekPosition / 1000.0, 1000))
                 applyPlayback()
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) { if (request == generation) fail(error.message ?: "Playback failed") }
@@ -156,8 +167,12 @@ class AvPlayerAdapter(
         target?.let { select(it, reason) }
     }
 
-    override fun play() { playWhenReady = true; if (nativePlayer.currentItem == null) prepare() }
-    override fun pause() { playWhenReady = false }
+    override fun play() = mutate { playWhenReady = true; if (nativePlayer.currentItem == null) prepare() }
+    override fun pause() {
+        playWhenReady = false
+        // The sleep timer expects its attenuation to clear only after playback has paused.
+        mutate { sleepFadeFactor = 1f }
+    }
     override fun stop() = mutate {
         playWhenReady = false; loadJob?.cancel(); generation++
         nativePlayer.replaceCurrentItemWithPlayerItem(null); setState(PlayerConstants.STATE_IDLE)
@@ -165,6 +180,7 @@ class AvPlayerAdapter(
     override fun prepare() = mutate { if (index < 0 && items.isNotEmpty()) index = 0; if (nativePlayer.currentItem == null) load() }
     override fun seekTo(positionMs: Long) = mutate {
         val position = positionMs.coerceAtLeast(0)
+        pendingSeekPosition = position
         nativePlayer.seekToTime(CMTimeMakeWithSeconds(position / 1000.0, 1000))
         listeners.toList().forEach { it.onSeeked(position) }
     }
@@ -179,7 +195,7 @@ class AvPlayerAdapter(
         if (target != null) select(target, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_SEEK) else seekTo(0)
     }
     override fun setMediaItem(mediaItem: GenericMediaItem) = mutate { clearMediaItems(); addMediaItem(mediaItem) }
-    override fun addMediaItem(mediaItem: GenericMediaItem) = addMediaItem(items.size, mediaItem)
+    override fun addMediaItem(mediaItem: GenericMediaItem) = mutate { addMediaItem(items.size, mediaItem) }
     override fun addMediaItem(index: Int, mediaItem: GenericMediaItem) = mutate {
         val at = index.coerceIn(0, items.size)
         items.add(at, mediaItem)
@@ -225,7 +241,7 @@ class AvPlayerAdapter(
     override fun getMediaItemAt(index: Int): GenericMediaItem? = items.getOrNull(index)
     override fun getCurrentMediaTimeLine(): List<GenericMediaItem> = order.mapNotNull(items::getOrNull)
     override fun getUnshuffledIndex(shuffledIndex: Int): Int = order.getOrElse(shuffledIndex) { -1 }
-    override val isPlaying get() = nativePlayer.rate > 0f && nativePlayer.error == null
+    override val isPlaying get() = nativePlayer.timeControlStatus == AVPlayerTimeControlStatusPlaying && nativePlayer.error == null
     override val currentPosition get() = secondsToMillis(CMTimeGetSeconds(nativePlayer.currentTime()))
     override val duration get() = nativePlayer.currentItem?.let { secondsToMillis(CMTimeGetSeconds(it.duration)) } ?: 0L
     override val bufferedPosition get() = nativePlayer.currentItem?.loadedTimeRanges?.lastOrNull()?.let {
@@ -241,18 +257,18 @@ class AvPlayerAdapter(
     override fun hasNextMediaItem() = index in items.indices && (order.indexOf(index) < order.lastIndex || repeatMode == PlayerConstants.REPEAT_MODE_ALL)
     override fun hasPreviousMediaItem() = order.indexOf(index) > 0 || (items.isNotEmpty() && repeatMode == PlayerConstants.REPEAT_MODE_ALL)
     override var shuffleModeEnabled = false
-        set(value) { field = value; mutate { rebuildOrder(); listeners.toList().forEach { it.onShuffleModeEnabledChanged(value, getCurrentMediaTimeLine()) } } }
+        set(value) { mutate { field = value; rebuildOrder(); listeners.toList().forEach { it.onShuffleModeEnabledChanged(value, getCurrentMediaTimeLine()) } } }
     override var repeatMode = PlayerConstants.REPEAT_MODE_OFF
-        set(value) { field = value; mutate { listeners.toList().forEach { it.onRepeatModeChanged(value) } } }
+        set(value) { mutate { field = value; listeners.toList().forEach { it.onRepeatModeChanged(value) } } }
     override var playWhenReady = false
-        set(value) { field = value; mutate { applyPlayback() } }
+        set(value) { mutate { field = value; applyPlayback() } }
     override var playbackParameters = GenericPlaybackParameters.DEFAULT
-        set(value) { field = value; mutate { applyPlayback() } }
+        set(value) { mutate { field = value; applyPlayback() } }
     override val audioSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
     override var volume = 1f
-        set(value) { field = value.coerceIn(0f, 1f); mutate { nativePlayer.volume = field * sleepFadeFactor; listeners.toList().forEach { it.onVolumeChanged(field) } } }
+        set(value) { mutate { field = value.coerceIn(0f, 1f); nativePlayer.volume = field * sleepFadeFactor; listeners.toList().forEach { it.onVolumeChanged(field) } } }
     override var sleepFadeFactor = 1f
-        set(value) { field = value.coerceIn(0f, 1f); mutate { nativePlayer.volume = volume * field } }
+        set(value) { mutate { field = value.coerceIn(0f, 1f); nativePlayer.volume = volume * field } }
     override var crossfadeSuppressed = false
     override var albumTrackIds: Set<String> = emptySet()
     override var skipSilenceEnabled = false
